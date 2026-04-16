@@ -27,3 +27,5 @@
 ## Personal Notes
 - When experimenting locally, use `-depth 1` to limit scrape depth and avoid long-running test runs
 - The `testdata/` directory is gitignored locally for scratch CSV outputs
+- Prefer `-concurrency 2` when testing locally to avoid getting rate-limited or flagged by Google
+- Use `-lang en` explicitly in local runs so output is consistent regardless of system locale
