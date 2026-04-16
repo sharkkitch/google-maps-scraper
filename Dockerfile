@@ -52,8 +52,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpango-1.0-0 \
     libcairo2 \
     libasound2t64 \
+    # tzdata allows setting TZ env var for correct local time in logs
+    tzdata \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# Default to UTC; override at runtime with -e TZ=America/New_York etc.
+ENV TZ=UTC
 
 COPY --from=playwright-deps /opt/browsers /opt/browsers
 COPY --from=playwright-deps /root/.cache/ms-playwright-go /opt/ms-playwright-go
