@@ -7,6 +7,7 @@
 - `make vet` - Run go vet static analysis
 - `make format` - Format code with gofmt
 - `go test ./path/to/package` - Run tests for a specific package
+- `go test -run TestName ./path/to/package` - Run a specific test by name
 
 ## Code Style Guidelines
 - Use `gofmt` for formatting (spaces, not tabs)
@@ -22,3 +23,7 @@
 - Add godoc comments for exported types and functions
 - Use `nolint` comments sparingly with explanations
 - Avoid magic numbers, use named constants or comment them
+
+## Personal Notes
+- When experimenting locally, use `-depth 1` to limit scrape depth and avoid long-running test runs
+- The `testdata/` directory is gitignored locally for scratch CSV outputs
