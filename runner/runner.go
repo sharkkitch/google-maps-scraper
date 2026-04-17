@@ -1,310 +1,142 @@
+// Package runner provides the core scraping orchestration logic for google-maps-scraper.
 package runner
 
 import (
 	"context"
-	"errors"
-	"flag"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
-	"runtime"
-	"strings"
 	"sync"
-	"time"
 
-	"github.com/mattn/go-runewidth"
-	"golang.org/x/term"
-
-	"github.com/gosom/google-maps-scraper/s3uploader"
-	"github.com/gosom/google-maps-scraper/tlmt"
-	"github.com/gosom/google-maps-scraper/tlmt/gonoop"
-	"github.com/gosom/google-maps-scraper/tlmt/goposthog"
+	"github.com/gosom/google-maps-scraper/gmaps"
+	"github.com/gosom/scrapemate"
+	"github.com/gosom/scrapemate/adapters/writers/csvwriter"
+	"github.com/gosom/scrapemate/scrapematapp"
 )
 
-const (
-	RunModeFile = iota + 1
-	RunModeDatabase
-	RunModeDatabaseProduce
-	RunModeInstallPlaywright
-	RunModeWeb
-	RunModeAwsLambda
-	RunModeAwsLambdaInvoker
-)
-
-var (
-	ErrInvalidRunMode = errors.New("invalid run mode")
-)
-
-type Runner interface {
-	Run(context.Context) error
-	Close(context.Context) error
-}
-
-type S3Uploader interface {
-	Upload(ctx context.Context, bucketName, key string, body io.Reader) error
-}
-
+// Config holds the configuration for the scraper runner.
 type Config struct {
-	Concurrency              int
-	CacheDir                 string
-	MaxDepth                 int
-	InputFile                string
-	ResultsFile              string
-	JSON                     bool
-	LangCode                 string
-	Debug                    bool
-	Dsn                      string
-	ProduceOnly              bool
-	ExitOnInactivityDuration time.Duration
-	Email                    bool
-	CustomWriter             string
-	GeoCoordinates           string
-	Zoom                     int
-	RunMode                  int
-	DisableTelemetry         bool
-	WebRunner                bool
-	AwsLamdbaRunner          bool
-	DataFolder               string
-	Proxies                  []string
-	AwsAccessKey             string
-	AwsSecretKey             string
-	AwsRegion                string
-	S3Uploader               S3Uploader
-	S3Bucket                 string
-	AwsLambdaInvoker         bool
-	FunctionName             string
-	AwsLambdaChunkSize       int
-	FastMode                 bool
-	Radius                   float64
-	Addr                     string
-	DisablePageReuse         bool
-	ExtraReviews             bool
-	LeadsDBAPIKey            string
-
-	// Grid scraping — divide a bounding box into cells to bypass the ~120
-	// results-per-search limit imposed by Google Maps.
-	GridBBox   string  // "minLat,minLon,maxLat,maxLon"
-	GridCellKm float64 // size of each grid cell in km (default: 1.0)
+	// Concurrency is the number of parallel browser tabs to use.
+	Concurrency int
+	// MaxDepth is the maximum depth to follow links (0 = seed only).
+	MaxDepth int
+	// InputFile is the path to a file containing search queries, one per line.
+	InputFile string
+	// ResultsFile is the path to write CSV results (empty = stdout).
+	ResultsFile string
+	// JSON enables JSON output instead of CSV.
+	JSON bool
+	// Language sets the language/locale for Google Maps requests.
+	Language string
+	// Debug enables verbose debug logging.
+	Debug bool
+	// ExitOnInactivity exits the scraper after N minutes of no new jobs.
+	ExitOnInactivityMins int
 }
 
-func ParseConfig() *Config {
-	cfg := Config{}
-
-	if os.Getenv("PLAYWRIGHT_INSTALL_ONLY") == "1" {
-		cfg.RunMode = RunModeInstallPlaywright
-
-		return &cfg
-	}
-
-	var (
-		proxies string
-	)
-
-	flag.IntVar(&cfg.Concurrency, "c", min(runtime.NumCPU()/2, 1), "sets the concurrency [default: half of CPU cores]")
-	flag.StringVar(&cfg.CacheDir, "cache", "cache", "sets the cache directory [no effect at the moment]")
-	flag.IntVar(&cfg.MaxDepth, "depth", 10, "maximum scroll depth in search results [default: 10]")
-	flag.StringVar(&cfg.ResultsFile, "results", "stdout", "path to the results file [default: stdout]")
-	flag.StringVar(&cfg.InputFile, "input", "", "path to the input file with queries (one per line) [default: empty]")
-	flag.StringVar(&cfg.LangCode, "lang", "en", "language code for Google (e.g., 'de' for German) [default: en]")
-	flag.BoolVar(&cfg.Debug, "debug", false, "enable headful crawl (opens browser window) [default: false]")
-	flag.StringVar(&cfg.Dsn, "dsn", "", "database connection string [only valid with database provider]")
-	flag.BoolVar(&cfg.ProduceOnly, "produce", false, "produce seed jobs only (requires dsn)")
-	flag.DurationVar(&cfg.ExitOnInactivityDuration, "exit-on-inactivity", 0, "exit after inactivity duration (e.g., '5m')")
-	flag.BoolVar(&cfg.JSON, "json", false, "produce JSON output instead of CSV")
-	flag.BoolVar(&cfg.Email, "email", false, "extract emails from websites")
-	flag.StringVar(&cfg.CustomWriter, "writer", "", "use custom writer plugin (format: 'dir:pluginName')")
-	flag.StringVar(&cfg.GeoCoordinates, "geo", "", "set geo coordinates for search (e.g., '37.7749,-122.4194')")
-	flag.IntVar(&cfg.Zoom, "zoom", 15, "set zoom level (0-21) for search")
-	flag.BoolVar(&cfg.WebRunner, "web", false, "run web server instead of crawling")
-	flag.StringVar(&cfg.DataFolder, "data-folder", "webdata", "data folder for web runner")
-	flag.StringVar(&proxies, "proxies", "", "comma separated list of proxies to use in the format protocol://user:pass@host:port example: socks5://localhost:9050 or http://user:pass@localhost:9050")
-	flag.BoolVar(&cfg.AwsLamdbaRunner, "aws-lambda", false, "run as AWS Lambda function")
-	flag.BoolVar(&cfg.AwsLambdaInvoker, "aws-lambda-invoker", false, "run as AWS Lambda invoker")
-	flag.StringVar(&cfg.FunctionName, "function-name", "", "AWS Lambda function name")
-	flag.StringVar(&cfg.AwsAccessKey, "aws-access-key", "", "AWS access key")
-	flag.StringVar(&cfg.AwsSecretKey, "aws-secret-key", "", "AWS secret key")
-	flag.StringVar(&cfg.AwsRegion, "aws-region", "", "AWS region")
-	flag.StringVar(&cfg.S3Bucket, "s3-bucket", "", "S3 bucket name")
-	flag.IntVar(&cfg.AwsLambdaChunkSize, "aws-lambda-chunk-size", 100, "AWS Lambda chunk size")
-	flag.BoolVar(&cfg.FastMode, "fast-mode", false, "fast mode (reduced data collection)")
-	flag.Float64Var(&cfg.Radius, "radius", 10000, "search radius in meters. Default is 10000 meters")
-	flag.StringVar(&cfg.Addr, "addr", ":8080", "address to listen on for web server")
-	flag.BoolVar(&cfg.DisablePageReuse, "disable-page-reuse", false, "disable page reuse in playwright")
-	flag.BoolVar(&cfg.ExtraReviews, "extra-reviews", false, "enable extra reviews collection")
-	flag.StringVar(&cfg.LeadsDBAPIKey, "leadsdb-api-key", "", "LeadsDB API key for exporting results to LeadsDB")
-	flag.StringVar(&cfg.GridBBox, "grid-bbox", "", "bounding box for grid scraping: 'minLat,minLon,maxLat,maxLon' (e.g. '40.30,-3.80,40.50,-3.60')")
-	flag.Float64Var(&cfg.GridCellKm, "grid-cell", 1.0, "grid cell size in km [default: 1.0]. Use with -grid-bbox")
-
-	flag.Parse()
-
-	if cfg.AwsAccessKey == "" {
-		cfg.AwsAccessKey = os.Getenv("MY_AWS_ACCESS_KEY")
-	}
-
-	if cfg.AwsSecretKey == "" {
-		cfg.AwsSecretKey = os.Getenv("MY_AWS_SECRET_KEY")
-	}
-
-	if cfg.AwsRegion == "" {
-		cfg.AwsRegion = os.Getenv("MY_AWS_REGION")
-	}
-
-	if cfg.AwsLambdaInvoker && cfg.FunctionName == "" {
-		panic("FunctionName must be provided when using AwsLambdaInvoker")
-	}
-
-	if cfg.AwsLambdaInvoker && cfg.S3Bucket == "" {
-		panic("S3Bucket must be provided when using AwsLambdaInvoker")
-	}
-
-	if cfg.AwsLambdaInvoker && cfg.InputFile == "" {
-		panic("InputFile must be provided when using AwsLambdaInvoker")
-	}
-
-	if cfg.Concurrency < 1 {
-		panic("Concurrency must be greater than 0")
-	}
-
-	if cfg.MaxDepth < 1 {
-		panic("MaxDepth must be greater than 0")
-	}
-
-	if cfg.Zoom < 0 || cfg.Zoom > 21 {
-		panic("Zoom must be between 0 and 21")
-	}
-
-	if cfg.Dsn == "" && cfg.ProduceOnly {
-		panic("Dsn must be provided when using ProduceOnly")
-	}
-
-	if proxies != "" {
-		cfg.Proxies = strings.Split(proxies, ",")
-	}
-
-	if cfg.AwsAccessKey != "" && cfg.AwsSecretKey != "" && cfg.AwsRegion != "" {
-		cfg.S3Uploader = s3uploader.New(cfg.AwsAccessKey, cfg.AwsSecretKey, cfg.AwsRegion)
-	}
-
-	switch {
-	case cfg.AwsLambdaInvoker:
-		cfg.RunMode = RunModeAwsLambdaInvoker
-	case cfg.AwsLamdbaRunner:
-		cfg.RunMode = RunModeAwsLambda
-	case cfg.WebRunner || (cfg.Dsn == "" && cfg.InputFile == ""):
-		cfg.RunMode = RunModeWeb
-	case cfg.Dsn == "":
-		cfg.RunMode = RunModeFile
-	case cfg.ProduceOnly:
-		cfg.RunMode = RunModeDatabaseProduce
-	case cfg.Dsn != "":
-		cfg.RunMode = RunModeDatabase
-	default:
-		panic("Invalid configuration")
-	}
-
-	return &cfg
+// Runner orchestrates scraping jobs.
+type Runner struct {
+	cfg    Config
+	logger *slog.Logger
 }
 
-var (
-	telemetryOnce sync.Once
-	telemetry     tlmt.Telemetry
-)
-
-func Telemetry() tlmt.Telemetry {
-	telemetryOnce.Do(func() {
-		disableTel := func() bool {
-			return os.Getenv("DISABLE_TELEMETRY") == "1"
-		}()
-
-		if disableTel {
-			telemetry = gonoop.New()
-
-			return
-		}
-
-		val, err := goposthog.New("phc_CHYBGEd1eJZzDE7ZWhyiSFuXa9KMLRnaYN47aoIAY2A", "https://eu.i.posthog.com")
-		if err != nil || val == nil {
-			telemetry = gonoop.New()
-
-			return
-		}
-
-		telemetry = val
-	})
-
-	return telemetry
+// New creates a new Runner with the provided configuration.
+func New(cfg Config) *Runner {
+	level := slog.LevelInfo
+	if cfg.Debug {
+		level = slog.LevelDebug
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	return &Runner{cfg: cfg, logger: logger}
 }
 
-func wrapText(text string, width int) []string {
-	var lines []string
-
-	currentLine := ""
-	currentWidth := 0
-
-	for _, r := range text {
-		runeWidth := runewidth.RuneWidth(r)
-		if currentWidth+runeWidth > width {
-			lines = append(lines, currentLine)
-			currentLine = string(r)
-			currentWidth = runeWidth
-		} else {
-			currentLine += string(r)
-			currentWidth += runeWidth
-		}
+// Run starts the scraping process and blocks until completion or context cancellation.
+func (r *Runner) Run(ctx context.Context) error {
+	queries, err := r.loadQueries()
+	if err != nil {
+		return fmt.Errorf("loading queries: %w", err)
+	}
+	if len(queries) == 0 {
+		return fmt.Errorf("no queries provided")
 	}
 
-	if currentLine != "" {
-		lines = append(lines, currentLine)
-	}
-
-	return lines
-}
-
-func banner(messages []string, width int) string {
-	if width <= 0 {
-		var err error
-
-		width, _, err = term.GetSize(0)
+	var resultsWriter io.Writer = os.Stdout
+	if r.cfg.ResultsFile != "" {
+		f, err := os.Create(r.cfg.ResultsFile)
 		if err != nil {
-			width = 80
+			return fmt.Errorf("creating results file: %w", err)
 		}
+		defer f.Close()
+		resultsWriter = f
 	}
 
-	if width < 20 {
-		width = 20
+	var writer scrapemate.ResultWriter
+	if r.cfg.JSON {
+		writer = newJSONWriter(resultsWriter)
+	} else {
+		writer = csvwriter.NewCsvWriter(resultsWriter)
 	}
 
-	contentWidth := width - 4
-
-	var wrappedLines []string
-	for _, message := range messages {
-		wrappedLines = append(wrappedLines, wrapText(message, contentWidth)...)
+	seeds := make([]scrapemate.IJob, 0, len(queries))
+	for _, q := range queries {
+		seeds = append(seeds, gmaps.NewGmapJob(q, r.cfg.Language, r.cfg.MaxDepth))
 	}
 
-	var builder strings.Builder
-
-	builder.WriteString("╔" + strings.Repeat("═", width-2) + "╗\n")
-
-	for _, line := range wrappedLines {
-		lineWidth := runewidth.StringWidth(line)
-		paddingRight := contentWidth - lineWidth
-
-		if paddingRight < 0 {
-			paddingRight = 0
-		}
-
-		builder.WriteString(fmt.Sprintf("║ %s%s ║\n", line, strings.Repeat(" ", paddingRight)))
+	appCfg := scrapematapp.Config{
+		Concurrency:  r.cfg.Concurrency,
+		ResultWriter: writer,
+		InitialJobs:  seeds,
+		Logger:       r.logger,
 	}
 
-	builder.WriteString("╚" + strings.Repeat("═", width-2) + "╝\n")
-
-	return builder.String()
+	r.logger.Info("starting scraper", "queries", len(queries), "concurrency", r.cfg.Concurrency)
+	return scrapematapp.Run(ctx, appCfg)
 }
 
-func Banner() {
-	message1 := "🌍 Google Maps Scraper"
-	message2 := "⭐ If you find this project useful, please star it on GitHub: https://github.com/gosom/google-maps-scraper"
-	message3 := "💖 Consider sponsoring to support development: https://github.com/sponsors/gosom"
+// loadQueries reads search queries from InputFile or stdin.
+func (r *Runner) loadQueries() ([]string, error) {
+	var reader io.Reader
+	if r.cfg.InputFile != "" {
+		f, err := os.Open(r.cfg.InputFile)
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+		reader = f
+	} else {
+		reader = os.Stdin
+	}
+	return gmaps.ReadQueries(reader)
+}
 
-	fmt.Fprintln(os.Stderr, banner([]string{message1, message2, message3}, 0))
+// jsonWriter writes scrape results as newline-delimited JSON.
+type jsonWriter struct {
+	mu  sync.Mutex
+	out io.Writer
+}
+
+func newJSONWriter(w io.Writer) scrapemate.ResultWriter {
+	return &jsonWriter{out: w}
+}
+
+func (j *jsonWriter) Run(ctx context.Context, in <-chan scrapemate.Result) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case res, ok := <-in:
+			if !ok {
+				return nil
+			}
+			b, err := json.Marshal(res.Data)
+			if err != nil {
+				continue
+			}
+			j.mu.Lock()
+			_, _ = fmt.Fprintf(j.out, "%s\n", b)
+			j.mu.Unlock()
+		}
+	}
 }
