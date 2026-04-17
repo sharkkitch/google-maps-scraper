@@ -48,7 +48,8 @@ func New(cfg Config) *Runner {
 	if cfg.Debug {
 		level = slog.LevelDebug
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	// Use JSON handler for structured logging - easier to parse with jq
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	return &Runner{cfg: cfg, logger: logger}
 }
 
@@ -111,32 +112,4 @@ func (r *Runner) loadQueries() ([]string, error) {
 	return gmaps.ReadQueries(reader)
 }
 
-// jsonWriter writes scrape results as newline-delimited JSON.
-type jsonWriter struct {
-	mu  sync.Mutex
-	out io.Writer
-}
-
-func newJSONWriter(w io.Writer) scrapemate.ResultWriter {
-	return &jsonWriter{out: w}
-}
-
-func (j *jsonWriter) Run(ctx context.Context, in <-chan scrapemate.Result) error {
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case res, ok := <-in:
-			if !ok {
-				return nil
-			}
-			b, err := json.Marshal(res.Data)
-			if err != nil {
-				continue
-			}
-			j.mu.Lock()
-			_, _ = fmt.Fprintf(j.out, "%s\n", b)
-			j.mu.Unlock()
-		}
-	}
-}
+// jsonWriter writes scrape results as newline-delim
