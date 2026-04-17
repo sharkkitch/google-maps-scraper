@@ -29,3 +29,4 @@
 - The `testdata/` directory is gitignored locally for scratch CSV outputs
 - Prefer `-concurrency 2` when testing locally to avoid getting rate-limited or flagged by Google
 - Use `-lang en` explicitly in local runs so output is consistent regardless of system locale
+- Use `-exit-on-inactivity 3m` during local testing to prevent the scraper from hanging indefinitely if Google throttles requests
